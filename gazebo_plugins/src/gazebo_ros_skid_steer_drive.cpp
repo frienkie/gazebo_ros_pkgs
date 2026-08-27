@@ -39,6 +39,7 @@
 
 #include <algorithm>
 #include <assert.h>
+#include <cmath>
 
 #include <gazebo_plugins/gazebo_ros_skid_steer_drive.h>
 
@@ -138,18 +139,17 @@ namespace gazebo {
     /*this->wheel_separation_ = this->parent->GetJoint(left_front_joint_name_)->GetAnchor(0).Distance(
     		this->parent->GetJoint(right_front_joint_name_)->GetAnchor(0));*/
 
-    this->wheel_separation_ = 0.4;
+    this->wheel_separation_ = 0.172;
 
     if (!_sdf->HasElement("wheelSeparation")) {
-      ROS_WARN_NAMED("skid_steer_drive", "GazeboRosSkidSteerDrive Plugin (ns = %s) missing <wheelSeparation>, defaults to value from robot_description: %f",
+      ROS_WARN_NAMED("skid_steer_drive", "GazeboRosSkidSteerDrive Plugin (ns = %s) missing <wheelSeparation>, defaults to %f",
           this->robot_namespace_.c_str(), this->wheel_separation_);
     } else {
       this->wheel_separation_ =
         _sdf->GetElement("wheelSeparation")->Get<double>();
     }
 
-    // TODO get this from robot_description
-    this->wheel_diameter_ = 0.15;
+    this->wheel_diameter_ = 0.09;
     if (!_sdf->HasElement("wheelDiameter")) {
       ROS_WARN_NAMED("skid_steer_drive", "GazeboRosSkidSteerDrive Plugin (ns = %s) missing <wheelDiameter>, defaults to %f",
           this->robot_namespace_.c_str(), this->wheel_diameter_);
@@ -157,7 +157,7 @@ namespace gazebo {
       this->wheel_diameter_ = _sdf->GetElement("wheelDiameter")->Get<double>();
     }
 
-    this->torque = 5.0;
+    this->torque = 50.0;
     if (!_sdf->HasElement("torque")) {
       ROS_WARN_NAMED("skid_steer_drive", "GazeboRosSkidSteerDrive Plugin (ns = %s) missing <torque>, defaults to %f",
           this->robot_namespace_.c_str(), this->torque);
@@ -205,6 +205,30 @@ namespace gazebo {
       this->update_rate_ = _sdf->GetElement("updateRate")->Get<double>();
     }
 
+    // Compensate for the longitudinal and lateral slip inherent in a skid
+    // steer chassis.  The Gazebo joint velocity motor only controls wheel
+    // speed; it does not close the loop around the model's actual velocity.
+    this->linear_velocity_p_gain_ = 1.0;
+    this->linear_velocity_i_gain_ = 0.1;
+    this->linear_velocity_d_gain_ = 0.0;
+    this->angular_velocity_p_gain_ = 1.0;
+    this->angular_velocity_i_gain_ = 0.1;
+    this->angular_velocity_d_gain_ = 0.0;
+    this->velocity_pid_max_correction_ = 2.0;
+#define GET_PID_PARAMETER(name, member) \
+    if (_sdf->HasElement(name)) \
+      this->member = _sdf->GetElement(name)->Get<double>()
+    GET_PID_PARAMETER("linearVelocityPGain", linear_velocity_p_gain_);
+    GET_PID_PARAMETER("linearVelocityIGain", linear_velocity_i_gain_);
+    GET_PID_PARAMETER("linearVelocityDGain", linear_velocity_d_gain_);
+    GET_PID_PARAMETER("angularVelocityPGain", angular_velocity_p_gain_);
+    GET_PID_PARAMETER("angularVelocityIGain", angular_velocity_i_gain_);
+    GET_PID_PARAMETER("angularVelocityDGain", angular_velocity_d_gain_);
+    GET_PID_PARAMETER("velocityPIDMaxCorrection", velocity_pid_max_correction_);
+#undef GET_PID_PARAMETER
+    this->velocity_pid_max_correction_ =
+      std::abs(this->velocity_pid_max_correction_);
+
     this->covariance_x_ = 0.0001;
     if (!_sdf->HasElement("covariance_x")) {
       ROS_WARN_NAMED("skid_steer_drive", "GazeboRosSkidSteerDrive Plugin (ns = %s) missing <covariance_x>, defaults to %f",
@@ -249,6 +273,10 @@ namespace gazebo {
 
     x_ = 0;
     rot_ = 0;
+    linear_velocity_integral_ = 0.0;
+    angular_velocity_integral_ = 0.0;
+    previous_linear_velocity_error_ = 0.0;
+    previous_angular_velocity_error_ = 0.0;
     alive_ = true;
 
     joints[LEFT_FRONT] = this->parent->GetJoint(left_front_joint_name_);
@@ -336,11 +364,43 @@ namespace gazebo {
 
   }
 
+  void GazeboRosSkidSteerDrive::Reset()
+  {
+#if GAZEBO_MAJOR_VERSION >= 8
+    last_update_time_ = this->world->SimTime();
+#else
+    last_update_time_ = this->world->GetSimTime();
+#endif
+
+    boost::mutex::scoped_lock scoped_lock(lock);
+    x_ = 0.0;
+    rot_ = 0.0;
+    std::fill(wheel_speed_, wheel_speed_ + 4, 0.0);
+    linear_velocity_integral_ = 0.0;
+    angular_velocity_integral_ = 0.0;
+    previous_linear_velocity_error_ = 0.0;
+    previous_angular_velocity_error_ = 0.0;
+  }
+
   // Update the controller
   void GazeboRosSkidSteerDrive::UpdateChild()
   {
 #ifdef ENABLE_PROFILER
     IGN_PROFILE("GazeboRosSkidSteerDrive::UpdateChild");
+#endif
+#if GAZEBO_MAJOR_VERSION > 2
+    // Joint::Reset may clear the ODE motor's maximum force after the model
+    // plugin Reset() callback.  Without fmax the requested wheel velocity is
+    // accepted as a target but the motor cannot produce torque to reach it.
+    for (unsigned int i = 0; i < 4; ++i) {
+      if (std::abs(torque - joints[i]->GetParam("fmax", 0)) > 1e-6) {
+        joints[i]->SetParam("fmax", 0, torque);
+      }
+    }
+#else
+    for (unsigned int i = 0; i < 4; ++i) {
+      joints[i]->SetMaxForce(0, torque);
+    }
 #endif
 #if GAZEBO_MAJOR_VERSION >= 8
     common::Time current_time = this->world->SimTime();
@@ -360,7 +420,7 @@ namespace gazebo {
       // Update robot in case new velocities have been requested
       IGN_PROFILE_BEGIN("getWheelVelocities");
 #endif
-      getWheelVelocities();
+      getWheelVelocities(seconds_since_last_update);
 #ifdef ENABLE_PROFILER
       IGN_PROFILE_END();
       IGN_PROFILE_BEGIN("SetVelocity");
@@ -379,7 +439,10 @@ namespace gazebo {
 #ifdef ENABLE_PROFILER
       IGN_PROFILE_END();
 #endif
-      last_update_time_+= common::Time(update_period_);
+      // Use the interval that was actually consumed by this control update.
+      // Advancing by only update_period_ reuses overlapping time intervals
+      // after a slow simulation step and causes the PID integral to wind up.
+      last_update_time_ = current_time;
     }
   }
 
@@ -392,11 +455,54 @@ namespace gazebo {
     callback_queue_thread_.join();
   }
 
-  void GazeboRosSkidSteerDrive::getWheelVelocities() {
+  double GazeboRosSkidSteerDrive::velocityCorrection(
+      double command, double actual, double step_time, double p_gain,
+      double i_gain, double d_gain, double &integral,
+      double &previous_error) {
+    if (std::abs(command) < 1e-6 || step_time <= 0.0) {
+      integral = 0.0;
+      previous_error = 0.0;
+      return 0.0;
+    }
+
+    const double error = command - actual;
+    integral += error * step_time;
+    if (i_gain != 0.0) {
+      const double integral_limit = velocity_pid_max_correction_ / std::abs(i_gain);
+      integral = std::max(-integral_limit, std::min(integral, integral_limit));
+    }
+    const double derivative = (error - previous_error) / step_time;
+    previous_error = error;
+    const double correction = p_gain * error + i_gain * integral + d_gain * derivative;
+    return std::max(-velocity_pid_max_correction_,
+        std::min(correction, velocity_pid_max_correction_));
+  }
+
+  void GazeboRosSkidSteerDrive::getWheelVelocities(double step_time) {
     boost::mutex::scoped_lock scoped_lock(lock);
 
-    double vr = x_;
-    double va = rot_;
+    ignition::math::Vector3d world_linear;
+    double actual_angular;
+#if GAZEBO_MAJOR_VERSION >= 8
+    world_linear = this->parent->WorldLinearVel();
+    actual_angular = this->parent->WorldAngularVel().Z();
+    const double yaw = this->parent->WorldPose().Rot().Yaw();
+#else
+    world_linear = this->parent->GetWorldLinearVel().Ign();
+    actual_angular = this->parent->GetWorldAngularVel().Ign().Z();
+    const double yaw = this->parent->GetWorldPose().Ign().Rot().Yaw();
+#endif
+    const double actual_linear =
+      std::cos(yaw) * world_linear.X() + std::sin(yaw) * world_linear.Y();
+
+    const double vr = x_ + velocityCorrection(x_, actual_linear, step_time,
+      linear_velocity_p_gain_, linear_velocity_i_gain_,
+      linear_velocity_d_gain_, linear_velocity_integral_,
+      previous_linear_velocity_error_);
+    const double va = rot_ + velocityCorrection(rot_, actual_angular, step_time,
+      angular_velocity_p_gain_, angular_velocity_i_gain_,
+      angular_velocity_d_gain_, angular_velocity_integral_,
+      previous_angular_velocity_error_);
 
     wheel_speed_[RIGHT_FRONT] = vr + va * wheel_separation_ / 2.0;
     wheel_speed_[RIGHT_REAR] = vr + va * wheel_separation_ / 2.0;
