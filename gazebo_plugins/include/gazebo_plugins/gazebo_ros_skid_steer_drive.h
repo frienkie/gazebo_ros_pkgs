@@ -71,6 +71,7 @@ namespace gazebo {
 	  GazeboRosSkidSteerDrive();
       ~GazeboRosSkidSteerDrive();
       void Load(physics::ModelPtr _parent, sdf::ElementPtr _sdf);
+      void Reset();
 
     protected:
       virtual void UpdateChild();
@@ -78,7 +79,10 @@ namespace gazebo {
 
     private:
       void publishOdometry(double step_time);
-      void getWheelVelocities();
+      void getWheelVelocities(double step_time);
+      double velocityCorrection(double command, double actual, double step_time,
+          double p_gain, double i_gain, double d_gain, double &integral,
+          double &previous_error);
 
       physics::WorldPtr world;
       physics::ModelPtr parent;
@@ -129,6 +133,18 @@ namespace gazebo {
       double update_rate_;
       double update_period_;
       common::Time last_update_time_;
+
+      double linear_velocity_p_gain_;
+      double linear_velocity_i_gain_;
+      double linear_velocity_d_gain_;
+      double angular_velocity_p_gain_;
+      double angular_velocity_i_gain_;
+      double angular_velocity_d_gain_;
+      double velocity_pid_max_correction_;
+      double linear_velocity_integral_;
+      double angular_velocity_integral_;
+      double previous_linear_velocity_error_;
+      double previous_angular_velocity_error_;
 
       double covariance_x_;
       double covariance_y_;
